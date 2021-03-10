@@ -1,15 +1,16 @@
 use crate::common::MumbleResult;
 use crate::mumbleproto::*;
 use crate::packet::{MessageType, Packet};
-use crate::socket::{read_packet, write_message, write_packet};
+use crate::socket::{SocketReader, SocketWriter};
 
-use tokio::{io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::{mpsc, Mutex}};
-use tokio::net::tcp::{ReadHalf, WriteHalf};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, Mutex};
+use tokio::io::{ReadHalf, WriteHalf};
 use openssl::ssl::{SslMethod, SslVerifyMode, SslConnector};
 use tokio_openssl::SslStream;
-use tokio::sync::oneshot;
-use tokio::sync::oneshot::{Receiver, Sender};
-use std::{future, pin::Pin, sync::Arc, thread::sleep, time::{Instant, Duration}};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Instant;
 
 const MUMBLE_VERSION: u32 = 0x1219;
 
@@ -21,11 +22,12 @@ enum MessageQueue {
 }
 
 pub struct MumbleClient {
-    stream: SslStream<TcpStream>,
     client_name: Option<String>,
     client_version: Option<String>,
     username: String,
-    password: Option<String>
+    password: Option<String>,
+    reader: Arc<Mutex<SocketReader<ReadHalf<SslStream<TcpStream>>>>>,
+    writer: Arc<Mutex<SocketWriter<WriteHalf<SslStream<TcpStream>>>>>
 }
 
 impl MumbleClient {
@@ -44,12 +46,15 @@ impl MumbleClient {
 
         Pin::new(&mut stream).connect().await?;
 
+        let (reader, writer) = tokio::io::split(stream);
+
         Ok(Self {
-            stream,
             client_name: None,
             client_version: None,
             username: String::new(),
             password: None,
+            reader: Arc::new(Mutex::new(SocketReader::new(reader))),
+            writer: Arc::new(Mutex::new(SocketWriter::new(writer)))
         })
     }
 
@@ -94,7 +99,9 @@ impl MumbleClient {
             os_version: self.client_version.clone(),
             release: None
         };
-        write_message(&mut self.stream, MessageType::Version, &version).await?;
+        let writer = Arc::clone(&self.writer);
+        let mut writer = writer.lock().await;
+        writer.write_message(MessageType::Version, &version).await?;
 
         let token = match tokens {
             Some(result) => result,
@@ -108,15 +115,15 @@ impl MumbleClient {
             opus: Some(opus),
             celt_versions: Vec::new()
         };
-        write_message(&mut self.stream, MessageType::Authenticate, &authenticate).await?;
+        writer.write_message(MessageType::Authenticate, &authenticate).await?;
 
         Ok(self)
     }
 
-    async fn ping<S: AsyncWriteExt + Unpin>(stream: &mut S) -> MumbleResult<Instant> {
+    async fn ping(writer: &mut SocketWriter<WriteHalf<SslStream<TcpStream>>>) -> MumbleResult<Instant> {
         let ping_message = Ping::default();
 
-        write_message(stream, MessageType::Ping, &ping_message).await?;
+        writer.write_message(MessageType::Ping, &ping_message).await?;
 
         println!("pinging!");
 
@@ -124,10 +131,8 @@ impl MumbleClient {
     }
 
     pub async fn listen(
-        self,
+        &mut self,
     ) -> MumbleResult<()> {
-
-        let (mut reader, mut writer) = tokio::io::split(self.stream);
 
         let (tx, rx) = mpsc::channel::<MessageQueue>(1);
         let tx = Arc::new(Mutex::new(tx));
@@ -153,22 +158,30 @@ impl MumbleClient {
             }
         });
 
+        let reader_ref = Arc::clone(&self.reader);
+
         let t2 = tokio::spawn(async move {
             let tx = t2tx.clone();
+            let reader_ref = reader_ref;
             loop {
+                let mut reader = reader_ref.lock().await;
 
-                match read_packet(&mut reader).await {
+                match reader.read_packet().await {
                     Ok(packet) => {
                         let tx = tx.lock().await;
-                        tx.send(MessageQueue::PacketRecieved { packet}).await.unwrap_or_default();
+                        tx.send(MessageQueue::PacketRecieved { packet }).await.unwrap_or_default();
                     },
                     _ => {}
                 };
+                drop(reader);
             }
         });
 
+        let writer_ref = Arc::clone(&self.writer);
+
         let t3 = tokio::spawn(async move {
             let rx = t3rx.clone();
+            let writer_ref = writer_ref.clone();
             loop {
 
                 let message = {
@@ -181,7 +194,10 @@ impl MumbleClient {
                 };
 
                 match message {
-                    MessageQueue::Ping => { Self::ping(&mut writer).await.unwrap(); },
+                    MessageQueue::Ping => { 
+                        let mut writer = writer_ref.lock().await;
+                        Self::ping(&mut writer).await.unwrap(); 
+                    },
                     MessageQueue::PacketRecieved { packet} => {
                         match packet.message_type() {
                             MessageType::ChannelState => {
@@ -203,10 +219,7 @@ impl MumbleClient {
             }
         });
 
-        let(a, b, c) = tokio::join!(t1, t2, t3);
-        a.unwrap();
-        b.unwrap();
-        c.unwrap();
+        let _ = tokio::join!(t1, t2, t3);
 
         Ok(())
     }

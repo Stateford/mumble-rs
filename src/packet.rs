@@ -1,4 +1,4 @@
-use crate::common::{MumbleResult, MumbleFuture};
+use crate::common::MumbleResult;
 use crate::errors::MumbleError;
 use crate::utils::BufferParser;
 

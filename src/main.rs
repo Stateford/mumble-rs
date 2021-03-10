@@ -2,6 +2,7 @@ extern crate tokio;
 extern crate openssl;
 extern crate tokio_openssl;
 extern crate prost;
+extern crate bytes;
 
 pub mod mumbleproto {
     include!(concat!(env!("OUT_DIR"), "/mumble.rs"));
