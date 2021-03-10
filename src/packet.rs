@@ -1,4 +1,4 @@
-use crate::common::MumbleResult;
+use crate::common::{MumbleResult, MumbleFuture};
 use crate::errors::MumbleError;
 use crate::utils::BufferParser;
 
@@ -118,6 +118,8 @@ pub struct Packet {
     header: PacketHeader,
     packet: Vec<u8>
 }
+
+unsafe impl Send for Packet {}
 
 impl Packet {
 

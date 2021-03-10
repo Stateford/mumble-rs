@@ -18,20 +18,22 @@ mod ping;
 use common::MumbleResult;
 use mumble::MumbleClient;
 
-const MUMBLE_IP: &str = env!("MUMBLE_IP");
-const MUMBLE_USERNAME: &str = env!("MUMBLE_USERNAME");
-const MUMBLE_PASSWORD: &str = env!("MUMBLE_PASSWORD");
+static MUMBLE_IP: &'static str = "66.232.124.123:64738";
+static MUMBLE_USERNAME: &'static str = "imnotabot";
+static MUMBLE_PASSWORD: &'static str = "ye";
+
+static CLIENT_NAME: &'static str = "mumble-rs";
+static CLIENT_VERSION: &'static str = "0.0.1"; // TODO: set to cargo version
 
 #[tokio::main]
 async fn main() -> MumbleResult<()> {
 
-    MumbleClient::new(MUMBLE_IP).await?
-        .listen(
-            MUMBLE_USERNAME, 
-            Some(MUMBLE_PASSWORD.to_owned()), 
-            None, 
-            false
-        ).await?;
+    let mut client = MumbleClient::new(MUMBLE_IP).await?;
+    client.set_client_info(Some(CLIENT_NAME), Some(CLIENT_VERSION));
+    client.set_username(MUMBLE_USERNAME);
+    client.set_password(Some(MUMBLE_PASSWORD));
+    client.authenticate(None, false).await?;
+    client.listen().await?;
 
     Ok(())
 }

@@ -14,6 +14,8 @@ impl MumbleError {
     }
 }
 
+unsafe impl Send for MumbleError {}
+
 impl Display for MumbleError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "Mumble Error: {}", self.message)

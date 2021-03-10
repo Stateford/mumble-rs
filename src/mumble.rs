@@ -1,44 +1,100 @@
 use crate::common::MumbleResult;
-use crate::socket::Socket;
 use crate::mumbleproto::*;
-use crate::packet::MessageType;
+use crate::packet::{MessageType, Packet};
+use crate::socket::{read_packet, write_message, write_packet};
 
-use std::time::Instant;
+use tokio::{io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::{mpsc, Mutex}};
+use tokio::net::tcp::{ReadHalf, WriteHalf};
+use openssl::ssl::{SslMethod, SslVerifyMode, SslConnector};
+use tokio_openssl::SslStream;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::{Receiver, Sender};
+use std::{future, pin::Pin, sync::Arc, thread::sleep, time::{Instant, Duration}};
 
 const MUMBLE_VERSION: u32 = 0x1219;
-const CLIENT_NAME: &str = "mumble-rs";
-const CLIENT_VERSION: &str = "0.0.1"; // TODO: set to cargo version
+
+enum MessageQueue {
+    Ping,
+    PacketRecieved {
+        packet: Packet
+    }
+}
 
 pub struct MumbleClient {
-    socket: Socket,
-    last_ping: Instant
+    stream: SslStream<TcpStream>,
+    client_name: Option<String>,
+    client_version: Option<String>,
+    username: String,
+    password: Option<String>
 }
 
 impl MumbleClient {
 
     pub async fn new(ip_address: &str) -> MumbleResult<Self> {
+
+        let mut connector = SslConnector::builder(SslMethod::tls())?;
+        connector.set_verify(SslVerifyMode::NONE);
+        // connector.set_ca_file("tests/cert.pem")?;
+        let ssl = connector.build()
+            .configure()?
+            .into_ssl("localhost")?;
+
+        let tcp_stream = TcpStream::connect(ip_address).await?;
+        let mut stream = SslStream::new(ssl, tcp_stream)?;
+
+        Pin::new(&mut stream).connect().await?;
+
         Ok(Self {
-            socket: Socket::connect(ip_address).await?,
-            last_ping: Instant::now()
+            stream,
+            client_name: None,
+            client_version: None,
+            username: String::new(),
+            password: None,
         })
     }
 
-    async fn authenticate(
+    pub fn set_username(&mut self, username: &str) -> &mut Self {
+        self.username = username.to_owned();
+        self
+    }
+
+    pub fn set_password(&mut self, password: Option<&str>) -> &mut Self {
+        self.password = match password {
+            Some(password) => Some(password.to_owned()),
+            None => None
+        };
+
+        self
+    }
+
+    pub fn set_client_info(&mut self, client_name: Option<&str>, client_version: Option<&str>) -> &mut Self {
+
+        self.client_name = match client_name {
+            Some(client_name) => Some(client_name.to_owned()),
+            None => None
+        };
+
+        self.client_version = match client_version {
+            Some(client_version) => Some(client_version.to_owned()),
+            None => None
+        };
+
+        self
+    }
+
+    pub async fn authenticate(
         &mut self,
-        username: &str,
-        password: Option<String>,
         tokens: Option<Vec<String>>,
         opus: bool
-    ) -> MumbleResult<()> {
+    ) -> MumbleResult<&mut Self> {
 
         let version = Version {
             version: Some(MUMBLE_VERSION),
-            os: Some(CLIENT_NAME.to_string()),
-            os_version: Some(CLIENT_VERSION.to_string()),
+            os: self.client_name.clone(),
+            os_version: self.client_version.clone(),
             release: None
         };
-
-        self.socket.write_message(MessageType::Version, &version).await?;
+        write_message(&mut self.stream, MessageType::Version, &version).await?;
 
         let token = match tokens {
             Some(result) => result,
@@ -46,66 +102,111 @@ impl MumbleClient {
         };
 
         let authenticate = Authenticate {
-            username: Some(username.to_string()),
-            password,
+            username: Some(self.username.clone()),
+            password: self.password.clone(),
             tokens: token,
             opus: Some(opus),
             celt_versions: Vec::new()
         };
+        write_message(&mut self.stream, MessageType::Authenticate, &authenticate).await?;
 
-        self.socket.write_message(MessageType::Authenticate, &authenticate).await?;
-
-        Ok(())
+        Ok(self)
     }
 
-    async fn ping(&mut self) -> MumbleResult<()> {
+    async fn ping<S: AsyncWriteExt + Unpin>(stream: &mut S) -> MumbleResult<Instant> {
         let ping_message = Ping::default();
-        self.socket.write_message(MessageType::Ping, &ping_message).await?;
-        self.last_ping = Instant::now();
 
-        Ok(())
+        write_message(stream, MessageType::Ping, &ping_message).await?;
+
+        println!("pinging!");
+
+        Ok(Instant::now())
     }
 
     pub async fn listen(
-        &mut self,
-        username: &str,
-        password: Option<String>,
-        tokens: Option<Vec<String>>,
-        opus: bool
+        self,
     ) -> MumbleResult<()> {
 
-        self.authenticate(username, password, tokens, opus).await?;
+        let (mut reader, mut writer) = tokio::io::split(self.stream);
 
-        while let Ok(packet) = self.socket.read_packet().await {
+        let (tx, rx) = mpsc::channel::<MessageQueue>(1);
+        let tx = Arc::new(Mutex::new(tx));
+        let rx = Arc::new(Mutex::new(rx));
 
-            let wait_ping = if self.last_ping.elapsed().as_secs() >= 20 {
-                Some(self.ping())
-            } else {
-                None
-            };
+        let t1tx = tx.clone();
+        let t2tx = tx.clone();
+        let t3rx = rx.clone();
 
-            // TODO: message handler
+        let t1 = tokio::spawn(async move {
 
-            match packet.message_type() {
-                MessageType::ChannelState => {
-                    let channel_state: ChannelState = packet.to_message()?;
-                    if let Some(name) = channel_state.name {
-                        println!("Name: {}", name);
-                    }
-                },
-                MessageType::UserState => {
-                    let user_state: UserState = packet.to_message()?;
-                    if let Some(name) = user_state.name {
-                        println!("Name: {}", name);
-                    }
-                },
-                _ => {}
+            let mut last_ping_time = Instant::now();
+            let tx = t1tx.clone();
+
+            loop {
+                if last_ping_time.elapsed().as_secs() >= 20 {
+
+                    let tx = tx.lock().await;
+                    tx.send(MessageQueue::Ping).await.unwrap_or_default();
+
+                    last_ping_time = Instant::now();
+                }
             }
+        });
 
-            if let Some(wait_ping) = wait_ping {
-                wait_ping.await?;
+        let t2 = tokio::spawn(async move {
+            let tx = t2tx.clone();
+            loop {
+
+                match read_packet(&mut reader).await {
+                    Ok(packet) => {
+                        let tx = tx.lock().await;
+                        tx.send(MessageQueue::PacketRecieved { packet}).await.unwrap_or_default();
+                    },
+                    _ => {}
+                };
             }
-        }
+        });
+
+        let t3 = tokio::spawn(async move {
+            let rx = t3rx.clone();
+            loop {
+
+                let message = {
+                    let mut rx = rx.lock().await;
+
+                    match rx.recv().await {
+                        Some(message) => message,
+                        None => continue
+                    }
+                };
+
+                match message {
+                    MessageQueue::Ping => { Self::ping(&mut writer).await.unwrap(); },
+                    MessageQueue::PacketRecieved { packet} => {
+                        match packet.message_type() {
+                            MessageType::ChannelState => {
+                                let channel_state: ChannelState = packet.to_message().unwrap();
+                                if let Some(name) = channel_state.name {
+                                    println!("Name: {}", name);
+                                }
+                            },
+                            MessageType::UserState => {
+                                let user_state: UserState = packet.to_message().unwrap();
+                                if let Some(name) = user_state.name {
+                                    println!("Name: {}", name);
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        let(a, b, c) = tokio::join!(t1, t2, t3);
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
 
         Ok(())
     }
