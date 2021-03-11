@@ -2,6 +2,7 @@ use crate::common::MumbleResult;
 use crate::mumbleproto::*;
 use crate::packet::{MessageType, Packet};
 use crate::socket::{SocketReader, SocketWriter};
+use crate::channel::{Channel, ChannelList};
 
 use tokio::{net::TcpStream, task::JoinHandle};
 use tokio::sync::{mpsc, mpsc::{Sender, Receiver}, Mutex};
@@ -17,7 +18,7 @@ const MUMBLE_VERSION: u32 = 0x1219;
 enum MumbleAction {
     Ping,
     MoveChannel {
-        channel: u32
+        channel: Channel
     },
     SetComment {
         comment: String
@@ -52,7 +53,8 @@ pub struct MumbleClient {
     tx_channel: Arc<Mutex<Sender<MessageQueue>>>,
     rx_channel: Arc<Mutex<Receiver<MessageQueue>>>,
     user_info: Arc<Mutex<UserInfo>>,
-    connected: Arc<AtomicBool>
+    connected: Arc<AtomicBool>,
+    channels: Arc<Mutex<ChannelList>>
 }
 
 impl MumbleClient {
@@ -77,8 +79,6 @@ impl MumbleClient {
         let tx = Arc::new(Mutex::new(tx));
         let rx = Arc::new(Mutex::new(rx));
 
-        let user_info = UserInfo::default();
-
         Ok(Self {
             client_name: None,
             client_version: None,
@@ -92,6 +92,7 @@ impl MumbleClient {
             tx_channel: tx,
             user_info: Arc::new(Mutex::new(UserInfo::default())),
             connected: Arc::new(AtomicBool::new(false)),
+            channels: Arc::new(Mutex::new(ChannelList::default()))
         })
     }
 
@@ -250,7 +251,8 @@ impl MumbleClient {
         let t3_running = Arc::clone(&self.running);
         let user_info = Arc::clone(&self.user_info);
 
-        let connected = self.connected.clone();
+        let connected = Arc::clone(&self.connected);
+        let channels = Arc::clone(&self.channels);
 
         let t3 = tokio::spawn(async move {
             let rx = t3rx.clone();
@@ -279,6 +281,13 @@ impl MumbleClient {
                             },
                             MumbleAction::MoveChannel { channel} => {
                                 let user_info = user_info.lock().await;
+
+                                let mut user_state = UserState::default();
+                                user_state.session = Some(user_info.session_id);
+                                user_state.name = Some(user_info.name.clone());
+                                user_state.channel_id = Some(channel.id);
+                                let mut writer = writer_ref.lock().await;
+                                writer.write_message(MessageType::UserState, &user_state).await.unwrap();
                             },
                             MumbleAction::SetComment { comment} => {
                                 let user_info = user_info.lock().await;
@@ -289,7 +298,6 @@ impl MumbleClient {
                                 user_state.name = Some(user_info.name.clone());
                                 let mut writer = writer_ref.lock().await;
                                 writer.write_message(MessageType::UserState, &user_state).await.unwrap();
-                                println!("Setting comment");
                             }
                         }
                     },
@@ -297,6 +305,10 @@ impl MumbleClient {
                         match packet.message_type() {
                             MessageType::ChannelState => {
                                 let channel_state: ChannelState = packet.to_message().unwrap();
+                                let channel = Channel::from_message(&channel_state).unwrap();
+                                let mut channels = channels.lock().await;
+                                channels.push(channel).unwrap();
+
                                 if let Some(name) = channel_state.name {
                                     println!("Name: {}", name);
                                 }
@@ -352,6 +364,25 @@ impl MumbleClient {
         let message = MessageQueue::Action {
             action: MumbleAction::SetComment {
                 comment: comment.to_owned()
+            }
+        };
+        let tx = tx.lock().await;
+        tx.send(message).await.unwrap_or_default();
+
+        Ok(())
+    }
+
+    pub async fn get_channels(&self) -> ChannelList {
+        let channels = self.channels.clone();
+        let channels = channels.lock().await;
+        channels.clone()
+    }
+
+    pub async fn join_channel(&mut self, channel: Channel) -> MumbleResult<()> {
+        let tx = self.tx_channel.clone();
+        let message = MessageQueue::Action {
+            action: MumbleAction::MoveChannel {
+                channel
             }
         };
         let tx = tx.lock().await;

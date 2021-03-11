@@ -15,8 +15,7 @@ mod packet;
 mod socket;
 mod mumble;
 mod ping;
-
-use std::time::Duration;
+mod channel;
 
 use common::MumbleResult;
 use mumble::MumbleClient;
@@ -33,6 +32,12 @@ async fn main() -> MumbleResult<()> {
     client.listen().await?;
 
     client.set_comment("HELLO").await?;
+
+    let channels = client.get_channels().await;
+    if let Some(channel) = channels.find("Sp3cs personal AFK channel") {
+        println!("Joining channel!");
+        client.join_channel(channel).await?;
+    }
 
     loop {}
 
