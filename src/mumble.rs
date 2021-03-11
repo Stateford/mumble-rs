@@ -3,22 +3,41 @@ use crate::mumbleproto::*;
 use crate::packet::{MessageType, Packet};
 use crate::socket::{SocketReader, SocketWriter};
 
-use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::{net::TcpStream, task::JoinHandle};
+use tokio::sync::{mpsc, mpsc::{Sender, Receiver}, Mutex};
 use tokio::io::{ReadHalf, WriteHalf};
 use openssl::ssl::{SslMethod, SslVerifyMode, SslConnector};
 use tokio_openssl::SslStream;
-use std::pin::Pin;
+use std::{pin::Pin, sync::atomic::{AtomicBool, Ordering}, time::Duration};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MUMBLE_VERSION: u32 = 0x1219;
 
-enum MessageQueue {
+enum MumbleAction {
     Ping,
+    MoveChannel {
+        channel: u32
+    },
+    SetComment {
+        comment: String
+    }
+}
+
+enum MessageQueue {
+    Action { 
+        action: MumbleAction 
+    },
     PacketRecieved {
         packet: Packet
     }
+}
+
+#[derive(Default)]
+struct UserInfo {
+    session_id: u32,
+    name: String,
+    channel_id: u32
 }
 
 pub struct MumbleClient {
@@ -27,7 +46,13 @@ pub struct MumbleClient {
     username: String,
     password: Option<String>,
     reader: Arc<Mutex<SocketReader<ReadHalf<SslStream<TcpStream>>>>>,
-    writer: Arc<Mutex<SocketWriter<WriteHalf<SslStream<TcpStream>>>>>
+    writer: Arc<Mutex<SocketWriter<WriteHalf<SslStream<TcpStream>>>>>,
+    threads: Vec<JoinHandle<()>>,
+    running: Arc<AtomicBool>,
+    tx_channel: Arc<Mutex<Sender<MessageQueue>>>,
+    rx_channel: Arc<Mutex<Receiver<MessageQueue>>>,
+    user_info: Arc<Mutex<UserInfo>>,
+    connected: Arc<AtomicBool>
 }
 
 impl MumbleClient {
@@ -48,18 +73,33 @@ impl MumbleClient {
 
         let (reader, writer) = tokio::io::split(stream);
 
+        let (tx, rx) = mpsc::channel::<MessageQueue>(3);
+        let tx = Arc::new(Mutex::new(tx));
+        let rx = Arc::new(Mutex::new(rx));
+
+        let user_info = UserInfo::default();
+
         Ok(Self {
             client_name: None,
             client_version: None,
             username: String::new(),
             password: None,
             reader: Arc::new(Mutex::new(SocketReader::new(reader))),
-            writer: Arc::new(Mutex::new(SocketWriter::new(writer)))
+            writer: Arc::new(Mutex::new(SocketWriter::new(writer))),
+            threads: Vec::new(),
+            running: Arc::new(AtomicBool::new(false)),
+            rx_channel: rx,
+            tx_channel: tx,
+            user_info: Arc::new(Mutex::new(UserInfo::default())),
+            connected: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    pub fn set_username(&mut self, username: &str) -> &mut Self {
+    pub async fn set_username(&mut self, username: &str) -> &mut Self {
         self.username = username.to_owned();
+        let user_info = Arc::clone(&self.user_info);
+        let mut user_info = user_info.lock().await;
+        user_info.name = username.to_owned();
         self
     }
 
@@ -121,7 +161,27 @@ impl MumbleClient {
     }
 
     async fn ping(writer: &mut SocketWriter<WriteHalf<SslStream<TcpStream>>>) -> MumbleResult<Instant> {
-        let ping_message = Ping::default();
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis() as u64;
+
+        let mut ping_message = Ping::default();
+        ping_message.timestamp = Some(timestamp);
+
+        let ping_message = Ping {
+            good: None,
+            lost: None,
+            resync: None,
+            late: None,
+            tcp_packets: None,
+            tcp_ping_avg: None,
+            tcp_ping_var: None,
+            udp_packets: None,
+            udp_ping_avg: None,
+            udp_ping_var: None,
+            timestamp: Some(timestamp)
+        };
 
         writer.write_message(MessageType::Ping, &ping_message).await?;
 
@@ -134,36 +194,42 @@ impl MumbleClient {
         &mut self,
     ) -> MumbleResult<()> {
 
-        let (tx, rx) = mpsc::channel::<MessageQueue>(1);
-        let tx = Arc::new(Mutex::new(tx));
-        let rx = Arc::new(Mutex::new(rx));
+        // todo: move rx / tx to message handler
 
-        let t1tx = tx.clone();
-        let t2tx = tx.clone();
-        let t3rx = rx.clone();
+        let t1tx = self.tx_channel.clone();
+        let t2tx = self.tx_channel.clone();
+        let t3rx = self.rx_channel.clone();
+
+        self.running.store(true, Ordering::Relaxed);
+
+        let t1_running = Arc::clone(&self.running);
 
         let t1 = tokio::spawn(async move {
 
             let mut last_ping_time = Instant::now();
             let tx = t1tx.clone();
 
-            loop {
-                if last_ping_time.elapsed().as_secs() >= 20 {
+            while t1_running.load(Ordering::Relaxed) {
+                if last_ping_time.elapsed().as_secs() >= 10 {
 
                     let tx = tx.lock().await;
-                    tx.send(MessageQueue::Ping).await.unwrap_or_default();
-
+                    tx.send(MessageQueue::Action { action: MumbleAction::Ping }).await.unwrap_or_default();
                     last_ping_time = Instant::now();
                 }
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
 
         let reader_ref = Arc::clone(&self.reader);
 
+        let t2_running = Arc::clone(&self.running);
+
         let t2 = tokio::spawn(async move {
             let tx = t2tx.clone();
             let reader_ref = reader_ref;
-            loop {
+
+            while t2_running.load(Ordering::Relaxed) {
                 let mut reader = reader_ref.lock().await;
 
                 match reader.read_packet().await {
@@ -173,16 +239,26 @@ impl MumbleClient {
                     },
                     _ => {}
                 };
+
                 drop(reader);
+
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
 
         let writer_ref = Arc::clone(&self.writer);
+        let t3_running = Arc::clone(&self.running);
+        let user_info = Arc::clone(&self.user_info);
+
+        let connected = self.connected.clone();
 
         let t3 = tokio::spawn(async move {
             let rx = t3rx.clone();
             let writer_ref = writer_ref.clone();
-            loop {
+            let user_info = user_info;
+            let connected = connected;
+
+            while t3_running.load(Ordering::Relaxed) {
 
                 let message = {
                     let mut rx = rx.lock().await;
@@ -194,9 +270,28 @@ impl MumbleClient {
                 };
 
                 match message {
-                    MessageQueue::Ping => { 
-                        let mut writer = writer_ref.lock().await;
-                        Self::ping(&mut writer).await.unwrap(); 
+                    MessageQueue::Action { action} => { 
+
+                        match action {
+                            MumbleAction::Ping => {
+                                let mut writer = writer_ref.lock().await;
+                                Self::ping(&mut writer).await.unwrap(); 
+                            },
+                            MumbleAction::MoveChannel { channel} => {
+                                let user_info = user_info.lock().await;
+                            },
+                            MumbleAction::SetComment { comment} => {
+                                let user_info = user_info.lock().await;
+
+                                let mut user_state = UserState::default();
+                                user_state.session = Some(user_info.session_id);
+                                user_state.comment = Some(comment);
+                                user_state.name = Some(user_info.name.clone());
+                                let mut writer = writer_ref.lock().await;
+                                writer.write_message(MessageType::UserState, &user_state).await.unwrap();
+                                println!("Setting comment");
+                            }
+                        }
                     },
                     MessageQueue::PacketRecieved { packet} => {
                         match packet.message_type() {
@@ -208,19 +303,84 @@ impl MumbleClient {
                             },
                             MessageType::UserState => {
                                 let user_state: UserState = packet.to_message().unwrap();
+                                // println!("{:?}", user_state);
                                 if let Some(name) = user_state.name {
                                     println!("Name: {}", name);
+                                }
+                            },
+                            MessageType::Ping => {
+                                let ping: Ping = packet.to_message().unwrap();
+                                println!("{:?}", ping);
+                            },
+                            MessageType::ServerSync => {
+                                if !connected.load(Ordering::Relaxed) {
+                                    connected.store(true, Ordering::Relaxed);
+                                }
+                                let mut user_info = user_info.lock().await;
+                                let server_sync: ServerSync = packet.to_message().unwrap();
+                                if let Some(session_id) = server_sync.session {
+                                    user_info.session_id = session_id;
                                 }
                             },
                             _ => {}
                         }
                     }
                 }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
 
-        let _ = tokio::join!(t1, t2, t3);
+        self.threads.push(t1);
+        self.threads.push(t2);
+        self.threads.push(t3);
+
+        self.wait_for_connection().await?;
 
         Ok(())
+    }
+
+    async fn wait_for_connection(&mut self) -> MumbleResult<()> {
+        let connected = Arc::clone(&self.connected);
+        while !connected.load(Ordering::Relaxed) {}
+
+        Ok(())
+    }
+
+    pub async fn set_comment(&mut self, comment: &str) -> MumbleResult<()> {
+        let tx = self.tx_channel.clone();
+        let message = MessageQueue::Action {
+            action: MumbleAction::SetComment {
+                comment: comment.to_owned()
+            }
+        };
+        let tx = tx.lock().await;
+        tx.send(message).await.unwrap_or_default();
+
+        Ok(())
+    }
+
+    pub async fn shutdown(&mut self) -> MumbleResult<()> {
+        self.running.store(false, Ordering::Relaxed);
+
+        for thread in &self.threads {
+            thread.abort();
+        }
+
+        self.threads.clear();
+
+        Ok(())
+    }
+}
+
+
+impl Drop for MumbleClient {
+    fn drop(&mut self) {
+
+        self.running.store(false, Ordering::Relaxed);
+
+        for thread in &self.threads {
+            thread.abort();
+        }
     }
 }
