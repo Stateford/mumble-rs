@@ -11,6 +11,7 @@ tokio = {version = "1.2.0", features = ["full"]}
 openssl = "0.10.32"
 tokio-openssl = "0.6.1"
 prost = { version = "0.7", features = ["prost-derive"] }
+base64 = "0.13.0"
 bytes = "1"
 
 [build-dependencies]

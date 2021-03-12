@@ -16,6 +16,7 @@ mod socket;
 mod mumble;
 mod ping;
 mod channel;
+mod voice;
 
 use common::MumbleResult;
 use mumble::MumbleClient;
@@ -39,7 +40,12 @@ async fn main() -> MumbleResult<()> {
         client.join_channel(channel).await?;
     }
 
+    // client.send_message("testing").await?;
+
+    client.send_image(FILE_TO_SEND).await?;
+
     loop {}
+
 
     Ok(())
 }

@@ -3,15 +3,20 @@ use crate::mumbleproto::*;
 use crate::packet::{MessageType, Packet};
 use crate::socket::{SocketReader, SocketWriter};
 use crate::channel::{Channel, ChannelList};
+use crate::voice::packet::{AudioPacket, UdpPacket};
 
 use tokio::{net::TcpStream, task::JoinHandle};
 use tokio::sync::{mpsc, mpsc::{Sender, Receiver}, Mutex};
 use tokio::io::{ReadHalf, WriteHalf};
 use openssl::ssl::{SslMethod, SslVerifyMode, SslConnector};
 use tokio_openssl::SslStream;
-use std::{pin::Pin, sync::atomic::{AtomicBool, Ordering}, time::Duration};
+
+use std::{io::Read, pin::Pin};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::fs::File;
 
 const MUMBLE_VERSION: u32 = 0x1219;
 
@@ -22,6 +27,14 @@ enum MumbleAction {
     },
     SetComment {
         comment: String
+    },
+    SendMessage {
+        message: String,
+        channel_id: Option<u32>,
+        user_id: Option<u32>
+    },
+    SendVoice {
+        audio_packet: AudioPacket
     }
 }
 
@@ -280,7 +293,9 @@ impl MumbleClient {
                                 Self::ping(&mut writer).await.unwrap(); 
                             },
                             MumbleAction::MoveChannel { channel} => {
-                                let user_info = user_info.lock().await;
+                                let mut user_info = user_info.lock().await;
+
+                                user_info.channel_id = channel.id;
 
                                 let mut user_state = UserState::default();
                                 user_state.session = Some(user_info.session_id);
@@ -298,6 +313,33 @@ impl MumbleClient {
                                 user_state.name = Some(user_info.name.clone());
                                 let mut writer = writer_ref.lock().await;
                                 writer.write_message(MessageType::UserState, &user_state).await.unwrap();
+                            },
+                            MumbleAction::SendMessage { message, channel_id, user_id} => {
+                                let user_info = user_info.lock().await;
+
+                                let mut text_message = TextMessage::default();
+                                text_message.session = vec![user_info.session_id];
+                                text_message.message = message;
+                                text_message.channel_id = vec![user_info.channel_id];
+
+                                if let Some(channel_id) = channel_id {
+                                    text_message.channel_id = vec![channel_id];
+                                }
+
+                                let mut writer = writer_ref.lock().await;
+                                writer.write_message(MessageType::TextMessage, &text_message).await.unwrap();
+                            },
+                            MumbleAction::SendVoice { audio_packet} => {
+                                let user_info = user_info.lock().await;
+
+                                // audio_packet.set_session_id(user_info.session_id as u64);
+
+                                // let mut udp_tunnel = UdpTunnel {
+                                //     packet: audio_packet.to_bytes()
+                                // };
+
+                                // let mut writer = writer_ref.lock().await;
+                                // writer.write_message(MessageType::TextMessage, &text_message).await.unwrap();
                             }
                         }
                     },
@@ -387,6 +429,40 @@ impl MumbleClient {
         };
         let tx = tx.lock().await;
         tx.send(message).await.unwrap_or_default();
+
+        Ok(())
+    }
+
+    pub async fn send_message(&mut self, message: &str) -> MumbleResult<()> {
+        let tx = self.tx_channel.clone();
+        let message = MessageQueue::Action {
+            action: MumbleAction::SendMessage {
+                message: message.to_owned(),
+                channel_id: None,
+                user_id: None
+            }
+        };
+        let tx = tx.lock().await;
+        tx.send(message).await.unwrap_or_default();
+
+        Ok(())
+    }
+
+    pub async fn send_image(&mut self, file_path: &str) -> MumbleResult<()> {
+
+        let mut contents = File::open(file_path)?;
+        let mut buffer: Vec<u8> = Vec::new();
+        contents.read_to_end(&mut buffer)?;
+        let contents = base64::encode(&buffer);
+
+        // TODO:  send other image types
+
+        let mut data = String::new();
+        data.push_str("<img src=\"data:image/JPEG;base64,");
+        data.push_str(&contents);
+        data.push_str("\"/>");
+
+        self.send_message(&data).await?;
 
         Ok(())
     }
