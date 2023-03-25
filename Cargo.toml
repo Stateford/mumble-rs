@@ -8,7 +8,7 @@ edition = "2018"
 
 [dependencies]
 tokio = {version = "1.8.4", features = ["full"]}
-openssl = "0.10.32"
+openssl = "0.10.48"
 tokio-openssl = "0.6.1"
 prost = { version = "0.7", features = ["prost-derive"] }
 base64 = "0.13.0"
